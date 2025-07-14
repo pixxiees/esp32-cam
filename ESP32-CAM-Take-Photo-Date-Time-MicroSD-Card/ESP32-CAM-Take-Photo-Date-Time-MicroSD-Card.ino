@@ -14,6 +14,7 @@
 #include "driver/rtc_io.h"
 #include <WiFi.h>
 #include "time.h"
+#include <vector>
 
 // REPLACE WITH YOUR NETWORK CREDENTIALS
 const char* ssid = "Adhyasta";
@@ -23,7 +24,6 @@ const char* password = "juarasatu";
 String myTimezone ="<-07>7";
 
 // Pin definition for CAMERA_MODEL_AI_THINKER
-// Change pin definition if you're using another ESP32 camera module
 #define PWDN_GPIO_NUM     32
 #define FLASH_GPIO_NUM    4
 #define RESET_GPIO_NUM    -1
@@ -44,6 +44,20 @@ String myTimezone ="<-07>7";
 
 // Stores the camera configuration parameters
 camera_config_t config;
+
+// Struct untuk menyimpan gambar sementara
+struct PhotoData {
+  String filename;
+  std::vector<uint8_t> data;
+};
+
+std::vector<PhotoData> photoBuffer;
+
+#define TARGET_FPS 10
+#define FRAME_INTERVAL_MS (1000 / TARGET_FPS)
+unsigned long lastCaptureTime = 0;
+int frameCount = 0;
+const int MAX_BUFFERED_PHOTOS = 5;
 
 // Initializes the camera
 void configInitCamera(){
@@ -66,21 +80,19 @@ void configInitCamera(){
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG; //YUV422,GRAYSCALE,RGB565,JPEG
+  config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  // Select lower framesize if the camera doesn't support PSRAM
   if(psramFound()){
-    config.frame_size = FRAMESIZE_UXGA; // FRAMESIZE_ + QVGA|CIF|VGA|SVGA|XGA|SXGA|UXGA
-    config.jpeg_quality = 10; //0-63 lower number means higher quality
-    config.fb_count = 1;
+    config.frame_size = FRAMESIZE_SVGA; // Gunakan SVGA untuk keseimbangan ukuran
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
   } else {
-    config.frame_size = FRAMESIZE_SVGA;
+    config.frame_size = FRAMESIZE_VGA;
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
-  
-  // Initialize the Camera
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
@@ -101,7 +113,7 @@ void  initWiFi(){
 // Function to set timezone
 void setTimezone(String timezone){
   Serial.printf("  Setting Timezone to %s\n",timezone.c_str());
-  setenv("TZ",timezone.c_str(),1);  //  Now adjust the TZ.  Clock settings are adjusted to show the new local time
+  setenv("TZ",timezone.c_str(),1);
   tzset();
 }
 
@@ -109,33 +121,31 @@ void setTimezone(String timezone){
 void initTime(String timezone){
   struct tm timeinfo;
   Serial.println("Setting up time");
-  configTime(0, 0, "pool.ntp.org");    // First connect to NTP server, with 0 TZ offset
+  configTime(0, 0, "pool.ntp.org");
   if(!getLocalTime(&timeinfo)){
     Serial.println(" Failed to obtain time");
     return;
   }
   Serial.println("Got the time from NTP");
-  // Now we can set the real timezone
   setTimezone(timezone);
 }
 
-// Get the picture filename based on the current ime
+// Get the picture filename based on the current time
 String getPictureFilename(){
   struct tm timeinfo;
   if(!getLocalTime(&timeinfo)){
     Serial.println("Failed to obtain time");
     return "";
   }
-  char timeString[20];
+  char timeString[30];
+  int millisPart = millis() % 1000;
   strftime(timeString, sizeof(timeString), "%Y-%m-%d_%H-%M-%S", &timeinfo);
-  Serial.println(timeString);
-  String filename = "/picture_" + String(timeString) +".jpg";
-  return filename; 
+  String filename = "/pic_" + String(timeString) + "-" + String(millisPart) + ".jpg";
+  return filename;
 }
 
 // Initialize the micro SD card
 void initMicroSDCard(){
-  // Start Micro SD card
   Serial.println("Starting SD Card");
   if(!SD_MMC.begin()){
     Serial.println("SD Card Mount Failed");
@@ -148,65 +158,81 @@ void initMicroSDCard(){
   }
 }
 
-// Take photo and save to microSD card
-void takeSavePhoto(){
-  digitalWrite(FLASH_GPIO_NUM, LOW); // pastikan flash mati
+// Ambil foto dan simpan ke buffer (RAM)
+void takeBufferedPhoto(){
+  digitalWrite(FLASH_GPIO_NUM, LOW);
 
-  // Take Picture with Camera
   camera_fb_t * fb = esp_camera_fb_get();
- 
-  //Uncomment the following lines if you're getting old pictures
-  //esp_camera_fb_return(fb); // dispose the buffered image
-  //fb = NULL; // reset to capture errors
-  //fb = esp_camera_fb_get();
-  
   if(!fb) {
     Serial.println("Camera capture failed");
+    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
     delay(1000);
-    ESP.restart();
+    ESP.restart();  // Restart jika kamera gagal
   }
 
-  // Path where new picture will be saved in SD Card
+  if (photoBuffer.size() >= MAX_BUFFERED_PHOTOS) {
+    Serial.println("Buffer penuh, langsung menulis ke SD...");
+    flushBufferToSD();  // Tulis buffer sebelum ambil foto baru
+  }
+
   String path = getPictureFilename();
-  Serial.printf("Picture file name: %s\n", path.c_str());
-  
-  // Save picture to microSD card
-  fs::FS &fs = SD_MMC; 
-  File file = fs.open(path.c_str(),FILE_WRITE);
-  if(!file){
-    Serial.printf("Failed to open file in writing mode");
-  } 
-  else {
-    file.write(fb->buf, fb->len); // payload (image), payload length
-    Serial.printf("Saved: %s\n", path.c_str());
-  }
-  file.close();
-  esp_camera_fb_return(fb); 
+  Serial.printf("Buffered: %s (%d bytes)\n", path.c_str(), fb->len);
+  Serial.printf("Free heap sebelum simpan buffer: %u bytes\n", ESP.getFreeHeap());
 
-  digitalWrite(FLASH_GPIO_NUM, LOW); // pastikan flash mati
+  PhotoData photo;
+  photo.filename = path;
+  photo.data.assign(fb->buf, fb->buf + fb->len);
+  photoBuffer.push_back(photo);
+
+  Serial.printf("Buffer size: %d | Free heap setelah push: %u\n", photoBuffer.size(), ESP.getFreeHeap());
+
+  esp_camera_fb_return(fb);
+  digitalWrite(FLASH_GPIO_NUM, LOW);
+}
+
+// Tulis foto dari buffer ke SD card
+void flushBufferToSD(){
+  if (photoBuffer.empty()) return;
+
+  fs::FS &fs = SD_MMC;
+  for (auto &photo : photoBuffer) {
+    File file = fs.open(photo.filename.c_str(), FILE_WRITE);
+    if(!file){
+      Serial.printf("Failed to open file: %s\n", photo.filename.c_str());
+      continue;
+    }
+    file.write(photo.data.data(), photo.data.size());
+    file.close();
+    Serial.printf("Saved to SD: %s\n", photo.filename.c_str());
+  }
+  photoBuffer.clear();
 }
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // disable brownout detector
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
   delay(2000);
 
-  // Initialize Wi-Fi
   initWiFi();
-  // Initialize time with timezone
-  initTime(myTimezone);    
-  // Initialize the camera  
+  initTime(myTimezone);
   Serial.print("Initializing the camera module...");
   configInitCamera();
   Serial.println("Ok!");
-  // Initialize MicroSD
   Serial.print("Initializing the MicroSD card module... ");
   initMicroSDCard();
 }
 
-void loop() {    
-  // Take and Save Photo
-  takeSavePhoto();
-  delay(1000);
+void loop() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastCaptureTime >= FRAME_INTERVAL_MS) {
+    lastCaptureTime = currentMillis;
+    takeBufferedPhoto();
+    frameCount++;
+
+    // Tulis ke SD setiap 5 frame atau jika buffer penuh
+    if (frameCount % 5 == 0) {
+      flushBufferToSD();
+    }
+  }
 }
