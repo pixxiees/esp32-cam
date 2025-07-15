@@ -144,66 +144,47 @@ String getPictureFilename(){
   return filename;
 }
 
-// Initialize the micro SD card
-void initMicroSDCard(){
-  Serial.println("Starting SD Card");
-  if(!SD_MMC.begin()){
-    Serial.println("SD Card Mount Failed");
-    return;
-  }
-  uint8_t cardType = SD_MMC.cardType();
-  if(cardType == CARD_NONE){
-    Serial.println("No SD Card attached");
-    return;
-  }
+//disable flash
+void disableFlash() {
+  rtc_gpio_init(GPIO_NUM_4);
+  rtc_gpio_set_direction(GPIO_NUM_4, RTC_GPIO_MODE_OUTPUT_ONLY);
+  rtc_gpio_set_level(GPIO_NUM_4, 0);
+  rtc_gpio_hold_en(GPIO_NUM_4);
 }
 
-// Ambil foto dan simpan ke buffer (RAM)
-void takeBufferedPhoto(){
-  digitalWrite(FLASH_GPIO_NUM, LOW);
 
+// Ambil dan simpan ke buffer
+void takeBufferedPhoto(){
   camera_fb_t * fb = esp_camera_fb_get();
-  if(!fb) {
+  if(!fb){
     Serial.println("Camera capture failed");
-    Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
     delay(1000);
-    ESP.restart();  // Restart jika kamera gagal
+    ESP.restart();
   }
 
   if (photoBuffer.size() >= MAX_BUFFERED_PHOTOS) {
-    Serial.println("Buffer penuh, langsung menulis ke SD...");
-    flushBufferToSD();  // Tulis buffer sebelum ambil foto baru
+    Serial.println("Buffer full — flushing via serial...");
+    flushBufferToSerial();
   }
 
   String path = getPictureFilename();
   Serial.printf("Buffered: %s (%d bytes)\n", path.c_str(), fb->len);
-  Serial.printf("Free heap sebelum simpan buffer: %u bytes\n", ESP.getFreeHeap());
 
   PhotoData photo;
   photo.filename = path;
   photo.data.assign(fb->buf, fb->buf + fb->len);
   photoBuffer.push_back(photo);
 
-  Serial.printf("Buffer size: %d | Free heap setelah push: %u\n", photoBuffer.size(), ESP.getFreeHeap());
-
   esp_camera_fb_return(fb);
-  digitalWrite(FLASH_GPIO_NUM, LOW);
 }
 
-// Tulis foto dari buffer ke SD card
-void flushBufferToSD(){
-  if (photoBuffer.empty()) return;
-
-  fs::FS &fs = SD_MMC;
+// Kirim isi buffer ke serial
+void flushBufferToSerial(){
   for (auto &photo : photoBuffer) {
-    File file = fs.open(photo.filename.c_str(), FILE_WRITE);
-    if(!file){
-      Serial.printf("Failed to open file: %s\n", photo.filename.c_str());
-      continue;
-    }
-    file.write(photo.data.data(), photo.data.size());
-    file.close();
-    Serial.printf("Saved to SD: %s\n", photo.filename.c_str());
+    Serial.println("===== START PHOTO =====");
+    Serial.println(photo.filename);
+    Serial.write(photo.data.data(), photo.data.size());
+    Serial.println("\n===== END PHOTO =====");
   }
   photoBuffer.clear();
 }
@@ -218,9 +199,8 @@ void setup() {
   initTime(myTimezone);
   Serial.print("Initializing the camera module...");
   configInitCamera();
+  disableFlash();
   Serial.println("Ok!");
-  Serial.print("Initializing the MicroSD card module... ");
-  initMicroSDCard();
 }
 
 void loop() {
